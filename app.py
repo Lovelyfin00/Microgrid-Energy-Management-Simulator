@@ -1,23 +1,16 @@
-"""
-Microgrid Energy Management Simulator — interactive dashboard.
-
-Run locally:    streamlit run app.py
-Deploy free:    Streamlit Community Cloud (share.streamlit.io) or
-                 Hugging Face Spaces (Streamlit SDK) — see README.md
-"""
-
 import matplotlib.pyplot as plt
 import streamlit as st
 
 from simulation import SCENARIOS, run_simulation
+from forecasting import train_forecast_model
 
 st.set_page_config(page_title="Microgrid EMS Simulator", layout="wide")
 
-st.title("☀️ Renewable Microgrid Energy Management Simulator")
+st.title("Hybrid Microgrid Energy Management Simulator")
 st.caption(
-    "A PV + battery + grid/generator microgrid, dispatched by a rule-based "
-    "Energy Management System. Adjust the system, run a scenario, and see "
-    "how it responds."
+    "A hybrid microgrid combining solar PV, battery storage, and backup power. "
+    "Change the system settings, run a scenario, and see how the Energy "
+    "Management System responds to changes in demand and available power."
 )
 
 # --------------------------------------------------------------------------
@@ -36,10 +29,18 @@ with st.sidebar:
         SCENARIOS,
         format_func=lambda s: {
             "baseline": "Baseline (normal operation)",
-            "cloud_event": "Cloud event (PV drops mid-simulation)",
+            "cloud_event": "Cloud event (PV dims for 6h)",
             "demand_spike": "Demand spike (load doubles for 6h)",
             "grid_outage": "Grid outage (grid unavailable for 6h)",
+            "inverter_failure": "Inverter failure (PV unavailable for 6h)",
         }[s],
+    )
+
+    st.header("Dispatch strategy")
+    dispatch_mode = st.radio(
+        "How should the EMS decide?",
+        ["rule_based", "optimized"],
+        format_func=lambda m: "Rule-based" if m == "rule_based" else "Optimized (cost-minimizing)",
     )
 
     st.header("Cost assumptions")
@@ -92,32 +93,65 @@ def render_run(df, summary, title):
         st.dataframe(df, use_container_width=True)
 
 
-if compare_clicked:
-    df_base, summary_base = run_simulation(
-        pv_capacity_kw, battery_capacity_kwh, base_load_kw, days,
-        "baseline", grid_price, diesel_price,
-    )
-    df_scn, summary_scn = run_simulation(
-        pv_capacity_kw, battery_capacity_kwh, base_load_kw, days,
-        scenario, grid_price, diesel_price,
-    )
-    left, right = st.columns(2)
-    with left:
-        render_run(df_base, summary_base, "Baseline")
-    with right:
-        render_run(df_scn, summary_scn, scenario.replace("_", " ").title())
+sim_tab, forecast_tab = st.tabs(["Simulation", "PV Forecasting"])
 
-elif run_clicked or True:
-    # Renders on first load too, so the app isn't blank before any click
-    df, summary = run_simulation(
-        pv_capacity_kw, battery_capacity_kwh, base_load_kw, days,
-        scenario, grid_price, diesel_price,
-    )
-    render_run(df, summary, scenario.replace("_", " ").title())
+with sim_tab:
+    if compare_clicked:
+        df_base, summary_base = run_simulation(
+            pv_capacity_kw, battery_capacity_kwh, base_load_kw, days,
+            "baseline", grid_price, diesel_price, dispatch_mode,
+        )
+        df_scn, summary_scn = run_simulation(
+            pv_capacity_kw, battery_capacity_kwh, base_load_kw, days,
+            scenario, grid_price, diesel_price, dispatch_mode,
+        )
+        left, right = st.columns(2)
+        with left:
+            render_run(df_base, summary_base, "Baseline")
+        with right:
+            render_run(df_scn, summary_scn, scenario.replace("_", " ").title())
+        df = df_scn  # feed the forecasting tab with the scenario run
 
-st.divider()
-st.caption(
-    "Engine: rule-based dispatch (PV → load → battery → grid → generator). "
-    "See simulation.py for the model. Built as a lightweight, fully "
-    "software-based microgrid EMS — no physical hardware involved."
-)
+    else:
+        # Renders on first load too, so the app isn't blank before any click
+        df, summary = run_simulation(
+            pv_capacity_kw, battery_capacity_kwh, base_load_kw, days,
+            scenario, grid_price, diesel_price, dispatch_mode,
+        )
+        render_run(df, summary, scenario.replace("_", " ").title())
+
+    st.divider()
+    st.caption(
+        "Engine: rule-based or PuLP-optimized dispatch "
+        "(PV → load → battery → grid → generator). See simulation.py for "
+        "the model. Built as a lightweight, fully software-based microgrid "
+        "EMS — no physical hardware involved."
+    )
+
+with forecast_tab:
+    st.subheader("Next-hour PV forecast (RandomForestRegressor)")
+    st.caption(
+        "Trains on the PV series from the run above, using the last 3 hours "
+        "plus hour-of-day as features. This is a demonstration of the "
+        "forecasting extension, not a production model."
+    )
+    try:
+        model, X_test, y_test, y_pred, r2 = train_forecast_model(df["pv_kw"])
+
+        fig, ax = plt.subplots(figsize=(10, 4))
+        ax.plot(range(len(y_test)), y_test, label="Actual PV", color="#f2a900")
+        ax.plot(range(len(y_pred)), y_pred, label="Predicted PV", color="#2471a3", linestyle="--")
+        ax.set_xlabel("Test hour")
+        ax.set_ylabel("PV output (kW)")
+        ax.legend()
+        st.pyplot(fig)
+
+        st.metric("Test R² score", f"{r2:.3f}")
+        st.caption(
+            "R² close to 1.0 means the model tracks the (synthetic) PV curve "
+            "well; it will look strong here mostly because the underlying "
+            "profile is a clean sine curve — a real forecasting model would "
+            "be evaluated against actual irradiance data instead."
+        )
+    except ValueError as e:
+        st.warning(str(e))

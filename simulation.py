@@ -2,8 +2,9 @@
 Microgrid Energy Management Simulator — core engine.
 
 Models an hourly PV + battery + grid/generator microgrid, dispatches
-power with a rule-based Energy Management System (EMS), and reports
-renewable penetration, unmet demand, and operating cost.
+power with either a rule-based or a cost-optimizing Energy Management
+System (EMS), and reports renewable penetration, unmet demand, and
+operating cost.
 
 No external data files required — PV and load profiles are generated
 synthetically so the simulator runs standalone.
@@ -11,6 +12,7 @@ synthetically so the simulator runs standalone.
 
 import numpy as np
 import pandas as pd
+import pulp
 
 
 # --------------------------------------------------------------------------
@@ -168,11 +170,78 @@ def dispatch(pv_kw: float, load_kw: float, battery: Battery,
     }
 
 
+def optimize_dispatch(pv_kw: float, load_kw: float, battery: Battery,
+                       grid_price: float, diesel_price: float,
+                       grid_available: bool = True,
+                       generator_available: bool = True,
+                       dt_hours: float = 1.0) -> dict:
+    """
+    One timestep of cost-minimizing dispatch, solved with PuLP.
+
+    PV is applied to load first (it's free, so it's never worth curtailing
+    in favor of a paid source). The solver then decides how the battery,
+    grid, and generator split covering whatever load PV didn't cover,
+    minimizing (grid_to_load * grid_price + generator_to_load * diesel_price),
+    subject to the battery's available charge/discharge headroom and the
+    requirement that all sources sum to exactly the remaining load (or to
+    unmet demand if nothing can cover it).
+
+    Falls back to leaving the deficit as unmet_demand if grid, generator,
+    and battery combined can't cover it (this is expected during a
+    grid-outage scenario with a small battery).
+    """
+    pv_to_load = min(pv_kw, load_kw)
+    remaining_load = load_kw - pv_to_load
+    pv_surplus = pv_kw - pv_to_load
+
+    # Free surplus PV always goes to the battery if there's headroom;
+    # this isn't part of the cost optimization since it's free energy.
+    pv_to_battery = battery.charge(pv_surplus, dt_hours) if pv_surplus > 0 else 0.0
+    pv_curtailed = pv_surplus - pv_to_battery
+
+    battery_max = battery.available_discharge_kw() if remaining_load > 0 else 0.0
+    grid_max = remaining_load if grid_available else 0.0
+    generator_max = remaining_load if generator_available else 0.0
+
+    if remaining_load <= 1e-9:
+        battery_to_load = grid_to_load = generator_to_load = unmet = 0.0
+    else:
+        prob = pulp.LpProblem("dispatch_cost_min", pulp.LpMinimize)
+        b = pulp.LpVariable("battery_to_load", 0, battery_max)
+        g = pulp.LpVariable("grid_to_load", 0, grid_max)
+        d = pulp.LpVariable("generator_to_load", 0, generator_max)
+        u = pulp.LpVariable("unmet_demand", 0, remaining_load)
+
+        # Unmet demand carries a heavy penalty so the solver only accepts
+        # it when grid + generator + battery genuinely can't cover the load.
+        unmet_penalty = 100 * max(grid_price, diesel_price, 0.01)
+        prob += g * grid_price + d * diesel_price + u * unmet_penalty
+        prob += b + g + d + u == remaining_load
+
+        prob.solve(pulp.PULP_CBC_CMD(msg=False))
+
+        battery_to_load = battery.discharge(b.value() or 0.0, dt_hours)
+        grid_to_load = g.value() or 0.0
+        generator_to_load = d.value() or 0.0
+        unmet = u.value() or 0.0
+
+    return {
+        "pv_to_load": pv_to_load,
+        "pv_to_battery": pv_to_battery,
+        "pv_curtailed": pv_curtailed,
+        "battery_to_load": battery_to_load,
+        "grid_to_load": grid_to_load,
+        "generator_to_load": generator_to_load,
+        "unmet_demand": unmet,
+        "soc_percent": battery.soc_percent,
+    }
+
+
 # --------------------------------------------------------------------------
 # Scenario runner
 # --------------------------------------------------------------------------
 
-SCENARIOS = ["baseline", "cloud_event", "demand_spike", "grid_outage"]
+SCENARIOS = ["baseline", "cloud_event", "demand_spike", "grid_outage", "inverter_failure"]
 
 
 def run_simulation(pv_capacity_kw: float, battery_capacity_kwh: float,
@@ -180,10 +249,12 @@ def run_simulation(pv_capacity_kw: float, battery_capacity_kwh: float,
                     scenario: str = "baseline",
                     grid_price_per_kwh: float = 0.15,
                     diesel_price_per_kwh: float = 0.35,
+                    dispatch_mode: str = "rule_based",
                     seed: int | None = 42) -> tuple[pd.DataFrame, dict]:
     """
     Run the microgrid simulation for `days` days at hourly resolution
-    under the given scenario. Returns (timeseries_df, summary_dict).
+    under the given scenario and dispatch_mode ("rule_based" or
+    "optimized"). Returns (timeseries_df, summary_dict).
     """
     if seed is not None:
         np.random.seed(seed)
@@ -192,14 +263,21 @@ def run_simulation(pv_capacity_kw: float, battery_capacity_kwh: float,
     disturbance_start = hours // 2  # place any disturbance mid-simulation
     disturbance_len = 6
 
+    # inverter_failure zeroes PV the same way a cloud event dims it, so it
+    # reuses the same generation-time window mechanism.
     cloud_window = (disturbance_start, disturbance_start + disturbance_len) \
-        if scenario == "cloud_event" else None
+        if scenario in ("cloud_event", "inverter_failure") else None
     spike_window = (disturbance_start, disturbance_start + disturbance_len) \
         if scenario == "demand_spike" else None
     grid_outage_window = (disturbance_start, disturbance_start + disturbance_len) \
         if scenario == "grid_outage" else None
 
     pv = generate_pv_profile(hours, pv_capacity_kw, cloud_event_window=cloud_window)
+    if scenario == "inverter_failure":
+        # Total loss of PV output for the window (inverter down = no PV
+        # reaches the bus at all), vs. cloud_event's partial ~10% dimming.
+        start, end = cloud_window
+        pv.iloc[start:end] = 0.0
     load = generate_load_profile(hours, base_load_kw, spike_window=spike_window)
 
     battery = Battery(capacity_kwh=battery_capacity_kwh)
@@ -208,8 +286,15 @@ def run_simulation(pv_capacity_kw: float, battery_capacity_kwh: float,
     for h in range(hours):
         grid_available = not (grid_outage_window and
                                grid_outage_window[0] <= h < grid_outage_window[1])
-        result = dispatch(pv.iloc[h], load.iloc[h], battery,
-                           grid_available=grid_available, generator_available=True)
+        if dispatch_mode == "optimized":
+            result = optimize_dispatch(
+                pv.iloc[h], load.iloc[h], battery,
+                grid_price=grid_price_per_kwh, diesel_price=diesel_price_per_kwh,
+                grid_available=grid_available, generator_available=True,
+            )
+        else:
+            result = dispatch(pv.iloc[h], load.iloc[h], battery,
+                               grid_available=grid_available, generator_available=True)
         result["hour"] = h
         result["pv_kw"] = pv.iloc[h]
         result["load_kw"] = load.iloc[h]
@@ -228,6 +313,7 @@ def run_simulation(pv_capacity_kw: float, battery_capacity_kwh: float,
 
     summary = {
         "scenario": scenario,
+        "dispatch_mode": dispatch_mode,
         "renewable_penetration_pct": round(renewable_penetration, 1),
         "unmet_demand_kwh": round(unmet_demand_kwh, 2),
         "total_operating_cost": round(total_cost, 2),
@@ -240,9 +326,10 @@ def run_simulation(pv_capacity_kw: float, battery_capacity_kwh: float,
 
 if __name__ == "__main__":
     # Quick smoke test when run directly: python simulation.py
-    for s in SCENARIOS:
-        _, summary = run_simulation(
-            pv_capacity_kw=10, battery_capacity_kwh=20, base_load_kw=6,
-            days=3, scenario=s,
-        )
-        print(summary)
+    for mode in ("rule_based", "optimized"):
+        for s in SCENARIOS:
+            _, summary = run_simulation(
+                pv_capacity_kw=10, battery_capacity_kwh=20, base_load_kw=6,
+                days=3, scenario=s, dispatch_mode=mode,
+            )
+            print(summary)
