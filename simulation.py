@@ -159,7 +159,8 @@ class Battery:
 
 def dispatch(pv_kw: float, load_kw: float, battery: Battery,
              grid_available: bool = True, generator_available: bool = True,
-             dt_hours: float = 1.0) -> dict:
+             dt_hours: float = 1.0,
+             generator_capacity_kw: float = 10.0) -> dict:
     """
     One timestep of rule-based dispatch.
 
@@ -187,8 +188,8 @@ def dispatch(pv_kw: float, load_kw: float, battery: Battery,
 
     generator_to_load = 0.0
     if remaining_load > 0 and generator_available:
-        generator_to_load = remaining_load
-        remaining_load = 0.0
+        generator_to_load = min(remaining_load, generator_capacity_kw)
+        remaining_load -= generator_to_load
 
     unmet_demand = max(remaining_load, 0.0)
 
@@ -209,7 +210,8 @@ def optimize_dispatch(pv_kw: float, load_kw: float, battery: Battery,
                        grid_price: float, diesel_price: float,
                        grid_available: bool = True,
                        generator_available: bool = True,
-                       dt_hours: float = 1.0) -> dict:
+                       dt_hours: float = 1.0,
+                       generator_capacity_kw: float = 10.0) -> dict:
     """
     One timestep of cost-minimizing dispatch, solved with PuLP.
 
@@ -236,7 +238,8 @@ def optimize_dispatch(pv_kw: float, load_kw: float, battery: Battery,
 
     battery_max = battery.available_discharge_kw() if remaining_load > 0 else 0.0
     grid_max = remaining_load if grid_available else 0.0
-    generator_max = remaining_load if generator_available else 0.0
+    generator_max = (min(remaining_load, generator_capacity_kw)
+                     if generator_available else 0.0)
 
     if remaining_load <= 1e-9:
         battery_to_load = renewable_battery_to_load = 0.0
@@ -288,7 +291,8 @@ def run_simulation(pv_capacity_kw: float, battery_capacity_kwh: float,
                     grid_price_per_kwh: float = 0.15,
                     diesel_price_per_kwh: float = 0.35,
                     dispatch_mode: str = "rule_based",
-                    seed: int | None = 42) -> tuple[pd.DataFrame, dict]:
+                    seed: int | None = 42,
+                    generator_capacity_kw: float = 10.0) -> tuple[pd.DataFrame, dict]:
     """
     Run the microgrid simulation for `days` days at hourly resolution
     under the given scenario and dispatch_mode ("rule_based" or
@@ -304,6 +308,8 @@ def run_simulation(pv_capacity_kw: float, battery_capacity_kwh: float,
         raise ValueError("Dispatch mode must be 'rule_based' or 'optimized'.")
     if grid_price_per_kwh < 0 or diesel_price_per_kwh < 0:
         raise ValueError("Energy prices cannot be negative.")
+    if generator_capacity_kw < 0:
+        raise ValueError("Generator capacity cannot be negative.")
 
     if seed is not None:
         np.random.seed(seed)
@@ -340,10 +346,12 @@ def run_simulation(pv_capacity_kw: float, battery_capacity_kwh: float,
                 pv.iloc[h], load.iloc[h], battery,
                 grid_price=grid_price_per_kwh, diesel_price=diesel_price_per_kwh,
                 grid_available=grid_available, generator_available=True,
+                generator_capacity_kw=generator_capacity_kw,
             )
         else:
             result = dispatch(pv.iloc[h], load.iloc[h], battery,
-                               grid_available=grid_available, generator_available=True)
+                               grid_available=grid_available, generator_available=True,
+                               generator_capacity_kw=generator_capacity_kw)
         result["hour"] = h
         result["pv_kw"] = pv.iloc[h]
         result["load_kw"] = load.iloc[h]
