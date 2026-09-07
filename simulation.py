@@ -82,15 +82,32 @@ class Battery:
                  charge_eff: float = 0.95, discharge_eff: float = 0.95,
                  max_charge_kw: float | None = None,
                  max_discharge_kw: float | None = None):
+        if capacity_kwh <= 0:
+            raise ValueError("Battery capacity must be greater than zero.")
+        if not 0 <= min_soc_frac <= initial_soc_frac <= max_soc_frac <= 1:
+            raise ValueError(
+                "SOC fractions must satisfy 0 <= min <= initial <= max <= 1."
+            )
+        if not 0 < charge_eff <= 1 or not 0 < discharge_eff <= 1:
+            raise ValueError("Battery efficiencies must be greater than zero and at most one.")
+        if max_charge_kw is not None and max_charge_kw < 0:
+            raise ValueError("Maximum charge rate cannot be negative.")
+        if max_discharge_kw is not None and max_discharge_kw < 0:
+            raise ValueError("Maximum discharge rate cannot be negative.")
+
         self.capacity_kwh = capacity_kwh
         self.soc_kwh = capacity_kwh * initial_soc_frac
+        self.renewable_soc_kwh = 0.0
+        self.last_discharge_renewable_kw = 0.0
         self.min_soc_kwh = capacity_kwh * min_soc_frac
         self.max_soc_kwh = capacity_kwh * max_soc_frac
         self.charge_eff = charge_eff
         self.discharge_eff = discharge_eff
         # Default rate limit: 0.5C if not specified
-        self.max_charge_kw = max_charge_kw or (0.5 * capacity_kwh)
-        self.max_discharge_kw = max_discharge_kw or (0.5 * capacity_kwh)
+        self.max_charge_kw = (0.5 * capacity_kwh
+                              if max_charge_kw is None else max_charge_kw)
+        self.max_discharge_kw = (0.5 * capacity_kwh
+                                 if max_discharge_kw is None else max_discharge_kw)
 
     @property
     def soc_percent(self) -> float:
@@ -109,15 +126,30 @@ class Battery:
     def charge(self, kw: float, dt_hours: float = 1.0) -> float:
         """Charge at up to `kw` for dt_hours; returns actual kW accepted."""
         kw = max(0.0, min(kw, self.available_charge_kw()))
-        self.soc_kwh += kw * self.charge_eff * dt_hours
+        stored_kwh = kw * self.charge_eff * dt_hours
+        self.soc_kwh += stored_kwh
+        self.renewable_soc_kwh += stored_kwh
         self.soc_kwh = min(self.soc_kwh, self.max_soc_kwh)
+        self.renewable_soc_kwh = min(self.renewable_soc_kwh, self.soc_kwh)
         return kw
 
     def discharge(self, kw: float, dt_hours: float = 1.0) -> float:
         """Discharge at up to `kw` for dt_hours; returns actual kW delivered."""
         kw = max(0.0, min(kw, self.available_discharge_kw()))
-        self.soc_kwh -= (kw / self.discharge_eff) * dt_hours
+        self.last_discharge_renewable_kw = 0.0
+        energy_removed_kwh = (kw / self.discharge_eff) * dt_hours
+        renewable_fraction = (
+            self.renewable_soc_kwh / self.soc_kwh if self.soc_kwh > 0 else 0.0
+        )
+        self.soc_kwh -= energy_removed_kwh
+        self.renewable_soc_kwh -= energy_removed_kwh * renewable_fraction
         self.soc_kwh = max(self.soc_kwh, self.min_soc_kwh)
+        self.renewable_soc_kwh = max(0.0, min(self.renewable_soc_kwh, self.soc_kwh))
+        if dt_hours > 0:
+            self.last_discharge_renewable_kw = (
+                energy_removed_kwh * renewable_fraction / dt_hours
+                * self.discharge_eff
+            )
         return kw
 
 
@@ -142,8 +174,10 @@ def dispatch(pv_kw: float, load_kw: float, battery: Battery,
     pv_to_battery = battery.charge(pv_surplus, dt_hours) if pv_surplus > 0 else 0.0
 
     battery_to_load = 0.0
+    renewable_battery_to_load = 0.0
     if remaining_load > 0:
         battery_to_load = battery.discharge(remaining_load, dt_hours)
+        renewable_battery_to_load = battery.last_discharge_renewable_kw
         remaining_load -= battery_to_load
 
     grid_to_load = 0.0
@@ -163,6 +197,7 @@ def dispatch(pv_kw: float, load_kw: float, battery: Battery,
         "pv_to_battery": pv_to_battery,
         "pv_curtailed": pv_surplus - pv_to_battery,
         "battery_to_load": battery_to_load,
+        "renewable_battery_to_load": renewable_battery_to_load,
         "grid_to_load": grid_to_load,
         "generator_to_load": generator_to_load,
         "unmet_demand": unmet_demand,
@@ -204,7 +239,8 @@ def optimize_dispatch(pv_kw: float, load_kw: float, battery: Battery,
     generator_max = remaining_load if generator_available else 0.0
 
     if remaining_load <= 1e-9:
-        battery_to_load = grid_to_load = generator_to_load = unmet = 0.0
+        battery_to_load = renewable_battery_to_load = 0.0
+        grid_to_load = generator_to_load = unmet = 0.0
     else:
         prob = pulp.LpProblem("dispatch_cost_min", pulp.LpMinimize)
         b = pulp.LpVariable("battery_to_load", 0, battery_max)
@@ -221,6 +257,7 @@ def optimize_dispatch(pv_kw: float, load_kw: float, battery: Battery,
         prob.solve(pulp.PULP_CBC_CMD(msg=False))
 
         battery_to_load = battery.discharge(b.value() or 0.0, dt_hours)
+        renewable_battery_to_load = battery.last_discharge_renewable_kw
         grid_to_load = g.value() or 0.0
         generator_to_load = d.value() or 0.0
         unmet = u.value() or 0.0
@@ -230,6 +267,7 @@ def optimize_dispatch(pv_kw: float, load_kw: float, battery: Battery,
         "pv_to_battery": pv_to_battery,
         "pv_curtailed": pv_curtailed,
         "battery_to_load": battery_to_load,
+        "renewable_battery_to_load": renewable_battery_to_load,
         "grid_to_load": grid_to_load,
         "generator_to_load": generator_to_load,
         "unmet_demand": unmet,
@@ -256,6 +294,17 @@ def run_simulation(pv_capacity_kw: float, battery_capacity_kwh: float,
     under the given scenario and dispatch_mode ("rule_based" or
     "optimized"). Returns (timeseries_df, summary_dict).
     """
+    if not isinstance(days, (int, np.integer)) or isinstance(days, bool) or days < 1:
+        raise ValueError("Simulation days must be a positive integer.")
+    if pv_capacity_kw < 0 or battery_capacity_kwh <= 0 or base_load_kw <= 0:
+        raise ValueError("PV capacity cannot be negative; battery capacity and base load must be greater than zero.")
+    if scenario not in SCENARIOS:
+        raise ValueError(f"Unknown scenario: {scenario}. Choose one of {SCENARIOS}.")
+    if dispatch_mode not in ("rule_based", "optimized"):
+        raise ValueError("Dispatch mode must be 'rule_based' or 'optimized'.")
+    if grid_price_per_kwh < 0 or diesel_price_per_kwh < 0:
+        raise ValueError("Energy prices cannot be negative.")
+
     if seed is not None:
         np.random.seed(seed)
 
@@ -305,7 +354,9 @@ def run_simulation(pv_capacity_kw: float, battery_capacity_kwh: float,
 
     # Summary metrics
     total_load = df["load_kw"].sum()
-    renewable_supplied = df["pv_to_load"].sum() + df["battery_to_load"].sum()
+    renewable_supplied = (
+        df["pv_to_load"].sum() + df["renewable_battery_to_load"].sum()
+    )
     renewable_penetration = 100 * renewable_supplied / total_load if total_load > 0 else 0
     unmet_demand_kwh = df["unmet_demand"].sum()
     total_cost = (df["grid_to_load"].sum() * grid_price_per_kwh +
